@@ -1,0 +1,9 @@
+{
+  "n": 30,
+  "m": 5,
+  "train_size": 1000,
+  "test_size": 4096,
+  "split_strategy": "relation-complete",
+  "seed": 42,
+  "relation_basis_size": 54
+}
