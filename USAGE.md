@@ -97,7 +97,10 @@ python plot.py "runs/*/metrics.csv" --out runs/grokking.png \
 | `--seed` | 42 | split 순서 + 입력 shuffle |
 | `--out` | 자동 | `data/n{n}_m{m}_tr{tr}_te{te}_{split}_s{seed}` |
 
-제약: `0 < m <= n`, `train_count + n_test <= C(n,m) <= 5,000,000`.
+공통 제약은 `0 < m <= n`, `train_count + n_test <= C(n,m)`, 실제 생성 행 수
+`train_count + n_test <= 5,000,000`이다. Random split은 `C(n,m)`이 아무리 커도
+필요한 조합만 rank 기반으로 비복원 샘플링한다. `relation-complete`만 전체 조합을
+검사하므로 `C(n,m) <= 5,000,000` 제한이 있다.
 
 `relation-complete`는 train이 모든 pair `{a,b}`를 최소 한 번 포함하도록 greedy로 채운다. 관계는 다 봤지만 그 조합은 못 본 상태를 만들어 일반화와 암기를 분리한다. `train_count`가 `ceil(C(n,2)/C(m,2))`(n30m5 → 44) 미만이거나 greedy basis(seed42 → 54)보다 작으면 error.
 
@@ -199,6 +202,7 @@ n30m5 tr1000 ascending은 250 step만에 test 0.99라 grokking이 안 보인다.
 | `--lr cannot be changed on resume` | resume은 `--steps`만 변경 가능. 나머지는 새 run |
 | `--steps N < already completed step M` | `--steps`를 M보다 크게 |
 | `train_count < lower bound` / `basis size > train_count` | 메시지가 알려주는 최소값 이상으로 `--train-count` |
-| `exceeds MAX_COMBINATIONS` | `C(n,m)` 500만 초과. n/m 축소 |
+| `exceeds MAX_COMBINATIONS` | relation-complete의 `C(n,m)`이 500만 초과. n/m을 줄이거나 random split 사용 |
+| `exceeds MAX_GENERATED_ROWS` | 생성할 train+test 행이 500만 초과. 개수 축소 |
 
 **재현성**: 같은 seed면 dataset, 초기화, batch 순서, eval subset이 모두 같다. checkpoint에 RNG state 전부와 eval index가 들어가 resume해도 갈라지지 않는다. 단 GPU가 다르면 완전 일치는 보장하지 않는다.

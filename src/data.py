@@ -4,12 +4,14 @@ import itertools
 import json
 import math
 import os
+import random
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# 전수 열거 상한 가드. C(n, m) 이 이보다 크면 명확한 error 로 중단한다.
+# 전수 열거 및 실제 생성 행 수의 독립적인 상한.
 MAX_COMBINATIONS = 5_000_000
+MAX_GENERATED_ROWS = 5_000_000
 
 
 # ---------------------------------------------------------------- vocabulary
@@ -38,7 +40,8 @@ def enumerate_combinations(n: int, m: int) -> np.ndarray:
     if total > MAX_COMBINATIONS:
         raise ValueError(
             f"C({n},{m}) = {total} exceeds MAX_COMBINATIONS = {MAX_COMBINATIONS}. "
-            "exhaustive enumeration is not feasible; reduce n/m."
+            "exhaustive enumeration is not feasible. Use a random split to sample "
+            "without enumerating the full combination space."
         )
     combos = np.fromiter(
         itertools.chain.from_iterable(itertools.combinations(range(n), m)),
@@ -46,6 +49,55 @@ def enumerate_combinations(n: int, m: int) -> np.ndarray:
         count=total * m,
     )
     return combos.reshape(total, m)
+
+
+def unrank_combination(rank: int, n: int, m: int) -> List[int]:
+    """Return the lexicographic combination at zero-based rank without enumeration."""
+    total = math.comb(n, m)
+    if rank < 0 or rank >= total:
+        raise ValueError(f"combination rank must satisfy 0 <= rank < {total}, got {rank}")
+
+    result: List[int] = []
+    start = 0
+    for i in range(m):
+        slots = m - i
+        prefix_total = math.comb(n - start, slots)
+        lo, hi = start, n - slots
+        while lo < hi:
+            candidate = (lo + hi + 1) // 2
+            skipped = prefix_total - math.comb(n - candidate, slots)
+            if skipped <= rank:
+                lo = candidate
+            else:
+                hi = candidate - 1
+        skipped = prefix_total - math.comb(n - lo, slots)
+        rank -= skipped
+        result.append(lo)
+        start = lo + 1
+    return result
+
+
+def sample_combinations(n: int, m: int, count: int, seed: int) -> np.ndarray:
+    """Uniformly sample unique combinations without materializing C(n,m) rows."""
+    total = math.comb(n, m)
+    if count < 0 or count > total:
+        raise ValueError(f"sample count must satisfy 0 <= count <= {total}, got {count}")
+
+    # Floyd's algorithm is O(count), including when total exceeds int64.
+    rng = random.Random(seed)
+    selected = set()
+    ranks: List[int] = []
+    for upper in range(total - count, total):
+        candidate = rng.randrange(upper + 1)
+        rank = upper if candidate in selected else candidate
+        selected.add(rank)
+        ranks.append(rank)
+    rng.shuffle(ranks)
+
+    dtype = np.int32 if n - 1 <= np.iinfo(np.int32).max else np.int64
+    return np.asarray(
+        [unrank_combination(rank, n, m) for rank in ranks], dtype=dtype
+    ).reshape(count, m)
 
 
 def _pair_ids(combos: np.ndarray, n: int) -> np.ndarray:
@@ -157,28 +209,45 @@ def generate_dataset(
     if n_test < 0:
         raise ValueError(f"n_test must be >= 0, got {n_test}")
     total = math.comb(n, m)
-    if train_count + n_test > total:
+    requested = train_count + n_test
+    if requested > total:
         raise ValueError(
-            f"train_count + n_test = {train_count + n_test} > C({n},{m}) = {total}"
+            f"train_count + n_test = {requested} > C({n},{m}) = {total}"
+        )
+    if requested > MAX_GENERATED_ROWS:
+        raise ValueError(
+            f"train_count + n_test = {requested} exceeds MAX_GENERATED_ROWS = "
+            f"{MAX_GENERATED_ROWS}"
         )
 
-    combos = enumerate_combinations(n, m)
     rng = np.random.default_rng(seed)
 
     if split_strategy == "random":
-        train_idx, test_idx, extra = random_split(combos, train_count, n_test, rng)
+        if total <= MAX_COMBINATIONS:
+            combos = enumerate_combinations(n, m)
+            train_idx, test_idx, extra = random_split(
+                combos, train_count, n_test, rng
+            )
+            train_combos = combos[train_idx]
+            test_combos = combos[test_idx]
+        else:
+            combos = sample_combinations(n, m, requested, seed)
+            train_combos = combos[:train_count]
+            test_combos = combos[train_count:]
+            extra = {}
     elif split_strategy == "relation-complete":
+        combos = enumerate_combinations(n, m)
         train_idx, test_idx, extra = relation_complete_split(
             combos, n, train_count, n_test, rng
         )
+        train_combos = combos[train_idx]
+        test_combos = combos[test_idx]
     else:
         raise ValueError(f"unknown split strategy '{split_strategy}'")
 
-    assert len(np.intersect1d(train_idx, test_idx)) == 0, "train/test overlap"
-
     # 각 combination 은 한 번만 무작위 shuffle 해서 입력으로 저장한다.
-    train_inputs = rng.permuted(combos[train_idx], axis=1)
-    test_inputs = rng.permuted(combos[test_idx], axis=1)
+    train_inputs = rng.permuted(train_combos, axis=1)
+    test_inputs = rng.permuted(test_combos, axis=1)
 
     if out_dir is None:
         out_dir = default_out_dir(n, m, train_count, n_test, split_strategy, seed)

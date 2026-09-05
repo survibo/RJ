@@ -213,6 +213,7 @@ m <= n
 train_count > 0
 n_test >= 0
 train_count + n_test <= C(n,m)
+train_count + n_test <= 5,000,000
 ```
 
 train/test는 combination 기준으로 disjoint해야 한다.
@@ -225,7 +226,16 @@ train/test는 combination 기준으로 disjoint해야 한다.
 
 `--split-strategy random`
 
-전체 `C(n,m)` combination에서 seed 기반으로 무작위 순서를 생성한다.
+전체 `C(n,m)` combination 공간에서 seed 기반으로 중복 없이 필요한 수만 선택한다.
+
+```text
+C(n,m) <= 5,000,000  -> 기존처럼 전체 조합을 열거한 뒤 선택
+C(n,m) > 5,000,000   -> 조합 rank를 직접 샘플링하고 해당 조합만 복원
+```
+
+따라서 random split에서는 `C(n,m)` 자체에 상한이 없고, 실제 생성하는
+`train_count + n_test` 행에만 5,000,000 상한을 적용한다. 작은 조합 공간은
+기존 생성 결과와 seed 호환성을 유지한다.
 
 그 순서에서:
 
@@ -267,6 +277,8 @@ C(m,2)
 개의 pair를 포함한다.
 
 relation-complete split은 train set이 모든 pair를 최소 한 번 포함하도록 구성한다.
+전체 combination을 대상으로 gain을 계산하므로 이 전략에 한해
+`C(n,m) <= 5,000,000`이어야 한다.
 
 ## 구성
 
