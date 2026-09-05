@@ -17,6 +17,7 @@ import json
 import os
 import random
 import time
+from contextlib import nullcontext
 from typing import Optional
 
 import numpy as np
@@ -71,11 +72,15 @@ LOCKED_ARGS = [
     "lr",
     "weight_decay",
     "warmup",
+    "precision",
+    "compile",
+    "fused_adamw",
     "grokfast",
     "grokfast_alpha",
     "grokfast_lamb",
     "grokfast_start_step",
     "eval_every",
+    "checkpoint_every",
     "n_eval",
     "seed",
 ]
@@ -92,12 +97,16 @@ ARG_SPECS = [
     ("--lr", dict(type=float, default=1e-3)),
     ("--weight-decay", dict(type=float, default=1.0)),
     ("--warmup", dict(type=int, default=10)),
+    ("--precision", dict(type=str, default="auto", choices=["auto", "fp32", "bf16"])),
+    ("--compile", dict(action=argparse.BooleanOptionalAction, default=True)),
+    ("--fused-adamw", dict(action=argparse.BooleanOptionalAction, default=True)),
     ("--grokfast", dict(action="store_true", default=False)),
     ("--grokfast-alpha", dict(type=float, default=0.98)),
     ("--grokfast-lamb", dict(type=float, default=2.0)),
     ("--grokfast-start-step", dict(type=int, default=0)),
     ("--steps", dict(type=int, default=100000)),
     ("--eval-every", dict(type=int, default=250)),
+    ("--checkpoint-every", dict(type=int, default=2500)),
     ("--n-eval", dict(type=int, default=4096)),
     ("--seed", dict(type=int, default=42)),
     ("--runs-dir", dict(type=str, default="runs")),
@@ -272,6 +281,10 @@ def main(argv=None) -> int:
                 "error: grokfast start step must be >= 0, "
                 f"got {args.grokfast_start_step}"
             )
+        if args.eval_every <= 0:
+            raise SystemExit("error: eval-every must be > 0")
+        if args.checkpoint_every <= 0:
+            raise SystemExit("error: checkpoint-every must be > 0")
         config = {
             "task": args.task,
             "modulus": args.modulus if args.task in MODULUS_TASKS else None,
@@ -289,12 +302,16 @@ def main(argv=None) -> int:
             "weight_decay": args.weight_decay,
             "betas": [0.9, 0.98],
             "warmup": args.warmup,
+            "precision": args.precision,
+            "compile": args.compile,
+            "fused_adamw": args.fused_adamw,
             "grokfast": args.grokfast,
             "grokfast_alpha": args.grokfast_alpha,
             "grokfast_lamb": args.grokfast_lamb,
             "grokfast_start_step": args.grokfast_start_step,
             "steps": args.steps,
             "eval_every": args.eval_every,
+            "checkpoint_every": args.checkpoint_every,
             "n_eval": args.n_eval,
             "data_dir": args.data_dir,
         }
@@ -309,6 +326,16 @@ def main(argv=None) -> int:
     n, m = config["n"], config["m"]
     modulus = config["modulus"]
     device = pick_device(args.device)
+
+    requested_precision = config["precision"]
+    bf16_supported = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    if requested_precision == "bf16" and not bf16_supported:
+        raise SystemExit("error: --precision bf16 requires a BF16-capable CUDA device")
+    use_bf16 = requested_precision == "bf16" or (
+        requested_precision == "auto" and bf16_supported
+    )
+    use_compile = device.type == "cuda" and config["compile"]
+    use_fused_adamw = device.type == "cuda" and config["fused_adamw"]
 
     # ---------------------------------------------------------------- seeding
     seed = config["seed"]
@@ -341,6 +368,7 @@ def main(argv=None) -> int:
         lr=config["lr"],
         betas=tuple(config["betas"]),
         weight_decay=config["weight_decay"],
+        fused=use_fused_adamw,
     )
     warmup = config["warmup"]
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -349,7 +377,8 @@ def main(argv=None) -> int:
     )
 
     # -------------------------------------------------- rng / eval subset 복원
-    batch_rng = np.random.default_rng(seed)
+    batch_rng = torch.Generator(device=device)
+    batch_rng.manual_seed(seed)
     eval_rng = np.random.default_rng(seed + 1)
     global_step = 0
     elapsed = 0.0
@@ -368,7 +397,7 @@ def main(argv=None) -> int:
             states = ckpt["cuda_rng"]
             if len(states) == torch.cuda.device_count():
                 torch.cuda.set_rng_state_all(states)
-        batch_rng.bit_generator.state = ckpt["batch_rng"]
+        batch_rng.set_state(ckpt["batch_rng"].to(device="cpu"))
         train_eval_idx = np.asarray(ckpt["train_eval_idx"], dtype=np.int64)
         test_eval_idx = np.asarray(ckpt["test_eval_idx"], dtype=np.int64)
         if config.get("grokfast", False):
@@ -386,6 +415,9 @@ def main(argv=None) -> int:
     train_eval = train_seqs[torch.from_numpy(train_eval_idx).to(device)]
     test_eval = test_seqs[torch.from_numpy(test_eval_idx).to(device)]
 
+    if use_compile:
+        model.compile(mode="reduce-overhead")
+
     metrics_path = os.path.join(run_dir, "metrics.csv")
     ckpt_path = os.path.join(run_dir, "ckpt_last.pt")
     eval_bs = max(1, config["batch_size"])
@@ -396,6 +428,9 @@ def main(argv=None) -> int:
     print(f"data      : {config['data_dir']}  train={train_size} test={test_seqs.shape[0]}")
     print(f"eval subs : train={len(train_eval_idx)} test={len(test_eval_idx)}")
     print(f"params    : {model.num_params()}")
+    print(f"precision : {'bf16' if use_bf16 else 'fp32'}")
+    print(f"compile   : {use_compile}")
+    print(f"fused opt : {use_fused_adamw}")
     print(f"steps     : {global_step} -> {config['steps']}")
     if config.get("grokfast", False):
         print(
@@ -406,11 +441,17 @@ def main(argv=None) -> int:
 
     start_time = time.time() - elapsed
 
+    def autocast_context():
+        if use_bf16:
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
     def do_eval() -> None:
-        tf_tr = teacher_forced_metrics(model, train_eval, m, eval_bs, device)
-        tf_te = teacher_forced_metrics(model, test_eval, m, eval_bs, device)
-        gen_tr = generation_metrics(model, train_eval, m, eval_bs, device)
-        gen_te = generation_metrics(model, test_eval, m, eval_bs, device)
+        with autocast_context():
+            tf_tr = teacher_forced_metrics(model, train_eval, m, eval_bs, device)
+            tf_te = teacher_forced_metrics(model, test_eval, m, eval_bs, device)
+            gen_tr = generation_metrics(model, train_eval, m, eval_bs, device)
+            gen_te = generation_metrics(model, test_eval, m, eval_bs, device)
         row = {
             "step": global_step,
             "wall_time": time.time() - start_time,
@@ -454,7 +495,7 @@ def main(argv=None) -> int:
                 "cuda_rng": torch.cuda.get_rng_state_all()
                 if device.type == "cuda"
                 else None,
-                "batch_rng": batch_rng.bit_generator.state,
+                "batch_rng": batch_rng.get_state().cpu(),
                 "train_eval_idx": train_eval_idx,
                 "test_eval_idx": test_eval_idx,
                 "grokfast_ema": grokfast_ema,
@@ -469,12 +510,19 @@ def main(argv=None) -> int:
     model.train()
     batch_size = config["batch_size"]
     eval_every = config["eval_every"]
+    checkpoint_every = config["checkpoint_every"]
     total_steps = config["steps"]
     while global_step < total_steps:
-        idx = batch_rng.integers(0, train_size, size=batch_size)  # replacement sampling
-        batch = train_seqs[torch.from_numpy(idx).to(device)]
-        logits = model(batch)
-        loss = output_loss(logits, batch, m)
+        idx = torch.randint(
+            train_size,
+            (batch_size,),
+            generator=batch_rng,
+            device=device,
+        )
+        batch = train_seqs[idx]
+        with autocast_context():
+            logits = model(batch)
+            loss = output_loss(logits, batch, m)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if (
@@ -491,8 +539,10 @@ def main(argv=None) -> int:
         scheduler.step()
         global_step += 1
 
-        if global_step % eval_every == 0 or global_step == total_steps:
+        is_final_step = global_step == total_steps
+        if global_step % eval_every == 0 or is_final_step:
             do_eval()
+        if global_step % checkpoint_every == 0 or is_final_step:
             save()
 
     print(f"done. run_dir = {run_dir}")

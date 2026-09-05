@@ -55,16 +55,9 @@ python train.py \
   --task ascending --modulus 5 \
   --n-embd 128 --n-head 4 --n-layer 2 \
   --batch-size 512 --lr 1e-3 --weight-decay 1.0 --warmup 10 \
-  --steps 100000 --eval-every 250 --n-eval 4096 \
+  --precision auto --compile --fused-adamw \
+  --steps 100000 --eval-every 250 --checkpoint-every 2500 --n-eval 4096 \
   --seed 42 --runs-dir runs --device auto
-
-# 기본 설정이면 이것만
-python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task ascending
-python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task mod --modulus 5
-python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task alternating
-python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task alt_mod --modulus 5
-python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task shift_mod --modulus 5
-python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task shift_alt_mod --modulus 5
 
 # Grokfast-EMA (기본 alpha=0.98, lambda=2.0, step 0부터 적용)
 python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task mod --grokfast
@@ -116,18 +109,22 @@ python plot.py "runs/*/metrics.csv" --out runs/grokking.png \
 | `--lr` | 1e-3 | AdamW |
 | `--weight-decay` | 1.0 | 전 파라미터 동일 적용. **grokking 타이밍 knob** |
 | `--warmup` | 10 | linear warmup step. 이후 constant |
+| `--precision` | auto | CUDA BF16 지원 시 `bf16`, 아니면 `fp32`. 명시값은 `fp32` / `bf16` |
+| `--compile` / `--no-compile` | 켜짐 | CUDA에서 `torch.compile(mode="reduce-overhead")` 사용 |
+| `--fused-adamw` / `--no-fused-adamw` | 켜짐 | CUDA에서 fused AdamW 사용 |
 | `--grokfast` | 꺼짐 | optimizer 직전에 Grokfast-EMA gradient filter 적용 |
 | `--grokfast-alpha` | 0.98 | gradient EMA 계수. `0 <= alpha < 1` |
 | `--grokfast-lamb` | 2.0 | EMA gradient 증폭 계수. 0 이상 |
 | `--grokfast-start-step` | 0 | 이 optimizer step부터 EMA 초기화 및 적용 |
 | `--steps` | 100000 | 총 step |
-| `--eval-every` | 250 | 평가 + CSV 1줄 + checkpoint 주기 |
+| `--eval-every` | 250 | 평가 + CSV 1줄 주기 |
+| `--checkpoint-every` | 2500 | `ckpt_last.pt` 저장 주기. 마지막 step은 항상 저장 |
 | `--n-eval` | 4096 | 평가 샘플 수. run 시작 시 고정, resume 후에도 동일. **CPU면 이걸 줄이는 게 제일 빠름** |
 | `--seed` | 42 | 초기화 + batch 순서 + eval subset |
 | `--runs-dir` | runs | run 부모 디렉토리 |
 | `--device` | auto | `auto` / `cpu` / `cuda` |
 
-run 이름은 `{task}_{split}_n{n}m{m}[_k{mod}]_tr{train}[_gfema-a{alpha}-l{lambda}][_gfstart{step}]_s{seed}`. **이미 있으면 error** — 지우거나 `--runs-dir`를 바꾼다. dropout 0, betas (0.9, 0.98), fp32 단일 GPU 고정. Grokfast EMA 상태도 checkpoint에 저장되므로 resume 시 이어진다.
+run 이름은 `{task}_{split}_n{n}m{m}[_k{mod}]_tr{train}[_gfema-a{alpha}-l{lambda}][_gfstart{step}]_s{seed}`. **이미 있으면 error** — 지우거나 `--runs-dir`를 바꾼다. dropout 0, betas (0.9, 0.98), 단일 GPU 기준이다. CUDA 기본값은 BF16 autocast, compiled model, fused AdamW이고 CPU는 FP32 eager mode다. Grokfast EMA 상태도 checkpoint에 저장되므로 resume 시 이어진다.
 
 ### plot.py
 

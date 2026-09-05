@@ -23,7 +23,7 @@ def output_loss(logits: torch.Tensor, seqs: torch.Tensor, m: int) -> torch.Tenso
     )
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def teacher_forced_metrics(
     model, seqs: torch.Tensor, m: int, batch_size: int, device: torch.device
 ) -> Dict[str, float]:
@@ -58,7 +58,7 @@ def teacher_forced_metrics(
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generate(model, prefix: torch.Tensor, m: int) -> torch.Tensor:
     """prefix: [B, m+2] (BOS x1..xm SEP). greedy 로 정확히 m 개 token 생성."""
     cur = prefix
@@ -69,7 +69,7 @@ def generate(model, prefix: torch.Tensor, m: int) -> torch.Tensor:
     return cur[:, prefix.shape[1] :]
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generation_metrics(
     model, seqs: torch.Tensor, m: int, batch_size: int, device: torch.device
 ) -> Dict[str, float]:
@@ -105,7 +105,7 @@ def generation_metrics(
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def param_norm(model) -> float:
     seen = {}
     for p in model.parameters():
@@ -115,6 +115,6 @@ def param_norm(model) -> float:
     return math.sqrt(total)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def embd_norm(model) -> float:
     return float(model.wte.weight.detach().float().norm().item())

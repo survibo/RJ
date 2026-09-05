@@ -1,6 +1,5 @@
 """GPT-2 style decoder-only Transformer (직접 구현)."""
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -30,15 +29,7 @@ class CausalSelfAttention(nn.Module):
         self.dropout = cfg.dropout
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
-        self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
-        self.register_buffer(
-            "mask",
-            torch.tril(torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool)).view(
-                1, 1, cfg.block_size, cfg.block_size
-            ),
-            persistent=False,
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -48,11 +39,13 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, hs).transpose(1, 2)
         v = v.view(B, T, self.n_head, hs).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(hs)
-        att = att.masked_fill(~self.mask[:, :, :T, :T], float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = att @ v
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True,
+        )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.c_proj(y))
 

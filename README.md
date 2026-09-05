@@ -566,6 +566,10 @@ python train.py \
 --weight-decay 1.0
 --warmup 10
 
+--precision auto
+--compile
+--fused-adamw
+
 --grokfast disabled
 --grokfast-alpha 0.98
 --grokfast-lamb 2.0
@@ -574,13 +578,16 @@ python train.py \
 --steps 100000
 
 --eval-every 250
+--checkpoint-every 2500
 --n-eval 4096
 
 --seed 42
 --runs-dir runs
 ```
 
-학습은 fp32 single GPU 기준으로 구현한다.
+CUDA에서는 BF16 지원 시 자동으로 BF16 autocast를 사용하고, compiled model과 fused
+AdamW를 기본으로 사용한다. 각각 `--precision fp32`, `--no-compile`,
+`--no-fused-adamw`로 비활성화할 수 있다. CPU는 FP32 eager mode를 사용한다.
 
 GPU가 없으면 CPU 실행 가능.
 
@@ -824,13 +831,16 @@ runs/
 
 # 26. Checkpoint
 
-항상:
+항상 최신 저장 시점의:
 
 ```text
 ckpt_last.pt
 ```
 
 하나만 유지한다.
+
+기본적으로 평가는 250 step마다 실행하고 checkpoint는 2500 step마다 저장한다.
+마지막 step에서는 주기와 관계없이 평가와 저장을 모두 실행한다.
 
 checkpoint 저장 내용:
 

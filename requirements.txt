@@ -1,6 +1,5 @@
-# GPU 환경 기준. Linux + CUDA 에서는 PyPI 기본 wheel 이 CUDA 빌드로 설치된다.
-# CUDA 버전을 고정하려면 아래처럼 index 를 지정해서 설치:
-#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
-torch>=2.2
+# RTX 50 series에서는 CUDA 12.8 wheel을 권장한다:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7
 numpy>=1.24
 matplotlib>=3.7
