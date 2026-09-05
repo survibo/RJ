@@ -1,0 +1,22 @@
+1) 예뻐요!
+
+python generate_data.py --n 70 --m 7 --train-count 4096 --n-test 20000 \
+  --split-strategy random --seed 42
+
+python train.py \
+  --data-dir data/n70_m7_tr4096_te20000_random_s42 \
+  --task shift_alt_mod --modulus 31 \
+  --n-embd 512 --n-head 8 --n-layer 4 \
+  --batch-size 1024 --lr 3e-4 --weight-decay 1.0 --warmup 100 \
+  --steps 100000 --eval-every 250 --n-eval 4096 \
+  --seed 42 --runs-dir runs5
+
+2) 드디어?
+
+python train.py \
+  --data-dir data/n70_m7_tr4096_te20000_random_s42 \
+  --task shift_alt_mod --modulus 37 \
+  --n-embd 768 --n-head 12 --n-layer 6 \
+  --batch-size 1024 --lr 1e-4 --weight-decay 1.0 --warmup 100 \
+  --steps 100000 --eval-every 50 --n-eval 4096 \
+  --seed 42 --runs-dir runs7
