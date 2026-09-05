@@ -472,6 +472,15 @@ python train.py \
   --steps 100000
 ```
 
+Grokfast-EMA:
+
+```bash
+python train.py \
+  --data-dir data/n30_m5_tr1000_te4096_random_s42 \
+  --task mod \
+  --grokfast --grokfast-alpha 0.98 --grokfast-lamb 2.0
+```
+
 기본 옵션:
 
 ```text
@@ -487,6 +496,11 @@ python train.py \
 --lr 1e-3
 --weight-decay 1.0
 --warmup 10
+
+--grokfast disabled
+--grokfast-alpha 0.98
+--grokfast-lamb 2.0
+--grokfast-start-step 0
 
 --steps 100000
 
@@ -724,6 +738,10 @@ runs/
   "betas": [0.9, 0.98],
 
   "warmup": 10,
+  "grokfast": false,
+  "grokfast_alpha": 0.98,
+  "grokfast_lamb": 2.0,
+  "grokfast_start_step": 0,
   "steps": 100000,
 
   "eval_every": 250,
@@ -749,6 +767,7 @@ checkpoint 저장 내용:
 model state
 optimizer state
 scheduler state
+Grokfast EMA state (enabled runs)
 global step
 
 Python RNG state

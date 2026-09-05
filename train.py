@@ -17,6 +17,7 @@ import json
 import os
 import random
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -70,6 +71,10 @@ LOCKED_ARGS = [
     "lr",
     "weight_decay",
     "warmup",
+    "grokfast",
+    "grokfast_alpha",
+    "grokfast_lamb",
+    "grokfast_start_step",
     "eval_every",
     "n_eval",
     "seed",
@@ -87,6 +92,10 @@ ARG_SPECS = [
     ("--lr", dict(type=float, default=1e-3)),
     ("--weight-decay", dict(type=float, default=1.0)),
     ("--warmup", dict(type=int, default=10)),
+    ("--grokfast", dict(action="store_true", default=False)),
+    ("--grokfast-alpha", dict(type=float, default=0.98)),
+    ("--grokfast-lamb", dict(type=float, default=2.0)),
+    ("--grokfast-start-step", dict(type=int, default=0)),
     ("--steps", dict(type=int, default=100000)),
     ("--eval-every", dict(type=int, default=250)),
     ("--n-eval", dict(type=int, default=4096)),
@@ -118,6 +127,12 @@ def run_name(cfg: dict) -> str:
     if cfg["task"] == "mod":
         parts.append(f"k{cfg['modulus']}")
     parts.append(f"tr{cfg['train_size']}")
+    if cfg.get("grokfast", False):
+        parts.append(
+            f"gfema-a{cfg['grokfast_alpha']:g}-l{cfg['grokfast_lamb']:g}"
+        )
+        if cfg["grokfast_start_step"] > 0:
+            parts.append(f"gfstart{cfg['grokfast_start_step']}")
     parts.append(f"s{cfg['seed']}")
     return "_".join(parts)
 
@@ -167,6 +182,30 @@ def save_checkpoint(path: str, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+@torch.no_grad()
+def apply_grokfast_ema(
+    model: torch.nn.Module,
+    ema: Optional[dict],
+    alpha: float,
+    lamb: float,
+) -> dict:
+    """Amplify the low-frequency component of each parameter gradient."""
+    if ema is None:
+        ema = {}
+
+    for name, parameter in model.named_parameters():
+        grad = parameter.grad
+        if not parameter.requires_grad or grad is None:
+            continue
+        if name not in ema:
+            ema[name] = grad.detach().clone()
+        else:
+            ema[name].mul_(alpha).add_(grad.detach(), alpha=1.0 - alpha)
+        grad.add_(ema[name], alpha=lamb)
+
+    return ema
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     provided = set(vars(build_parser(suppress=True).parse_args(argv)).keys())
@@ -214,6 +253,20 @@ def main(argv=None) -> int:
             )
         if args.task == "mod" and args.modulus <= 0:
             raise SystemExit(f"error: modulus must be > 0, got {args.modulus}")
+        if not 0.0 <= args.grokfast_alpha < 1.0:
+            raise SystemExit(
+                f"error: grokfast alpha must satisfy 0 <= alpha < 1, "
+                f"got {args.grokfast_alpha}"
+            )
+        if args.grokfast_lamb < 0.0:
+            raise SystemExit(
+                f"error: grokfast lambda must be >= 0, got {args.grokfast_lamb}"
+            )
+        if args.grokfast_start_step < 0:
+            raise SystemExit(
+                "error: grokfast start step must be >= 0, "
+                f"got {args.grokfast_start_step}"
+            )
         config = {
             "task": args.task,
             "modulus": args.modulus if args.task == "mod" else None,
@@ -231,6 +284,10 @@ def main(argv=None) -> int:
             "weight_decay": args.weight_decay,
             "betas": [0.9, 0.98],
             "warmup": args.warmup,
+            "grokfast": args.grokfast,
+            "grokfast_alpha": args.grokfast_alpha,
+            "grokfast_lamb": args.grokfast_lamb,
+            "grokfast_start_step": args.grokfast_start_step,
             "steps": args.steps,
             "eval_every": args.eval_every,
             "n_eval": args.n_eval,
@@ -291,6 +348,7 @@ def main(argv=None) -> int:
     eval_rng = np.random.default_rng(seed + 1)
     global_step = 0
     elapsed = 0.0
+    grokfast_ema = None
 
     if ckpt is not None:
         model.load_state_dict(ckpt["model"])
@@ -308,6 +366,14 @@ def main(argv=None) -> int:
         batch_rng.bit_generator.state = ckpt["batch_rng"]
         train_eval_idx = np.asarray(ckpt["train_eval_idx"], dtype=np.int64)
         test_eval_idx = np.asarray(ckpt["test_eval_idx"], dtype=np.int64)
+        if config.get("grokfast", False):
+            if "grokfast_ema" not in ckpt:
+                raise SystemExit("error: Grokfast checkpoint is missing EMA state")
+            saved_ema = ckpt["grokfast_ema"]
+            if saved_ema is not None:
+                grokfast_ema = {
+                    name: value.to(device) for name, value in saved_ema.items()
+                }
     else:
         train_eval_idx = pick_eval_indices(train_size, config["n_eval"], eval_rng)
         test_eval_idx = pick_eval_indices(test_seqs.shape[0], config["n_eval"], eval_rng)
@@ -326,6 +392,12 @@ def main(argv=None) -> int:
     print(f"eval subs : train={len(train_eval_idx)} test={len(test_eval_idx)}")
     print(f"params    : {model.num_params()}")
     print(f"steps     : {global_step} -> {config['steps']}")
+    if config.get("grokfast", False):
+        print(
+            f"grokfast  : EMA alpha={config['grokfast_alpha']:g} "
+            f"lambda={config['grokfast_lamb']:g} "
+            f"start={config['grokfast_start_step']}"
+        )
 
     start_time = time.time() - elapsed
 
@@ -380,6 +452,7 @@ def main(argv=None) -> int:
                 "batch_rng": batch_rng.bit_generator.state,
                 "train_eval_idx": train_eval_idx,
                 "test_eval_idx": test_eval_idx,
+                "grokfast_ema": grokfast_ema,
                 "config": config,
             },
         )
@@ -399,6 +472,16 @@ def main(argv=None) -> int:
         loss = output_loss(logits, batch, m)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if (
+            config.get("grokfast", False)
+            and global_step >= config["grokfast_start_step"]
+        ):
+            grokfast_ema = apply_grokfast_ema(
+                model,
+                grokfast_ema,
+                alpha=config["grokfast_alpha"],
+                lamb=config["grokfast_lamb"],
+            )
         optimizer.step()
         scheduler.step()
         global_step += 1
