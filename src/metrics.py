@@ -93,9 +93,8 @@ def generation_metrics(
         correct = pred.eq(target)
         token_correct += int(correct.sum().item())
         exact_correct += int(correct.all(dim=1).sum().item())
-        # 입력값에는 중복이 없으므로 sorted 비교로 permutation 판정
-        inputs = batch[:, 1 : m + 1]
-        valid = pred.sort(dim=1).values.eq(inputs.sort(dim=1).values).all(dim=1)
+        # 변환 task는 중복 token을 출력할 수 있으므로 target multiset과 비교한다.
+        valid = pred.sort(dim=1).values.eq(target.sort(dim=1).values).all(dim=1)
         valid_correct += int(valid.sum().item())
     if was_training:
         model.train()

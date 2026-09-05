@@ -37,7 +37,7 @@ from src.metrics import (
     teacher_forced_metrics,
 )
 from src.model import GPT, GPTConfig
-from src.tasks import TASK_REGISTRY, build_targets
+from src.tasks import MODULUS_TASKS, SHIFT_TASKS, TASK_REGISTRY, build_targets
 
 CSV_FIELDS = [
     "step",
@@ -124,7 +124,7 @@ def run_name(cfg: dict) -> str:
         cfg["split_strategy"],
         f"n{cfg['n']}m{cfg['m']}",
     ]
-    if cfg["task"] == "mod":
+    if cfg["task"] in MODULUS_TASKS:
         parts.append(f"k{cfg['modulus']}")
     parts.append(f"tr{cfg['train_size']}")
     if cfg.get("grokfast", False):
@@ -251,8 +251,13 @@ def main(argv=None) -> int:
             raise SystemExit(
                 f"error: n_embd ({args.n_embd}) % n_head ({args.n_head}) != 0"
             )
-        if args.task == "mod" and args.modulus <= 0:
+        if args.task in MODULUS_TASKS and args.modulus <= 0:
             raise SystemExit(f"error: modulus must be > 0, got {args.modulus}")
+        if args.task in SHIFT_TASKS and args.modulus > meta["n"]:
+            raise SystemExit(
+                f"error: modulus must be <= n ({meta['n']}) for task '{args.task}', "
+                f"got {args.modulus}"
+            )
         if not 0.0 <= args.grokfast_alpha < 1.0:
             raise SystemExit(
                 f"error: grokfast alpha must satisfy 0 <= alpha < 1, "
@@ -269,7 +274,7 @@ def main(argv=None) -> int:
             )
         config = {
             "task": args.task,
-            "modulus": args.modulus if args.task == "mod" else None,
+            "modulus": args.modulus if args.task in MODULUS_TASKS else None,
             "n": meta["n"],
             "m": meta["m"],
             "train_size": meta["train_size"],

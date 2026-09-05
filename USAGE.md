@@ -8,7 +8,7 @@ train.py         → runs/<run>/{config.json, metrics.csv, ckpt_last.pt}
 plot.py          → runs/grokking.png
 ```
 
-target은 저장하지 않는다. dataset 하나로 3개 task를 모두 학습할 수 있고, task는 `train.py --task`가 정한다.
+target은 저장하지 않는다. dataset 하나로 모든 task를 학습할 수 있고, task는 `train.py --task`가 정한다.
 
 ---
 
@@ -62,6 +62,9 @@ python train.py \
 python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task ascending
 python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task mod --modulus 5
 python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task alternating
+python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task alt_mod --modulus 5
+python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task shift_mod --modulus 5
+python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task shift_alt_mod --modulus 5
 
 # Grokfast-EMA (기본 alpha=0.98, lambda=2.0, step 0부터 적용)
 python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 --task mod --grokfast
@@ -103,8 +106,8 @@ python plot.py "runs/*/metrics.csv" --out runs/grokking.png \
 | 옵션 | 기본 | 의미 |
 |---|---|---|
 | `--data-dir` | — | dataset 경로. `--resume` 없으면 필수 |
-| `--task` | ascending | `ascending` / `mod`(`x%k`, 동률은 값 순) / `alternating`(`a0,a(m-1),a1,...`) |
-| `--modulus` | 5 | mod 전용. run 이름에 `k5`로 들어감 |
+| `--task` | ascending | `ascending` / `mod` / `alternating` / `alt_mod` / `shift_mod` / `shift_alt_mod` |
+| `--modulus` | 5 | modulo task 전용. run 이름에 `k5`로 들어감. shift task는 `modulus <= n` 필요 |
 | `--n-embd` / `--n-head` / `--n-layer` | 128 / 4 / 2 | `n_embd % n_head == 0` 필요. MLP hidden = `4*n_embd` |
 | `--batch-size` | 512 | 매 step 복원추출. train set보다 커도 됨 |
 | `--lr` | 1e-3 | AdamW |
@@ -137,7 +140,7 @@ run 이름은 `{task}_{split}_n{n}m{m}[_k{mod}]_tr{train}[_gfema-a{alpha}-l{lamb
 | `*_loss` | 출력 m개 토큰 CE 평균 (teacher forcing) |
 | `*_token_acc` / `*_exact_acc` | teacher forcing 위치별 정답률 / m개 전부 맞힌 비율 |
 | `*_gen_token_acc` / `*_gen_exact_acc` | greedy 생성 기준 같은 지표 |
-| `*_gen_valid_acc` | 생성 결과가 입력의 순열이기만 하면 1 |
+| `*_gen_valid_acc` | 생성 결과와 target의 token multiset이 같으면 1 |
 | `param_norm` `embd_norm` | 전체 파라미터 / token embedding L2 norm |
 
 **주 지표는 `test_gen_exact_acc`.** teacher-forced는 정답 prefix를 보여준 측정이라 낙관적이다.
@@ -147,7 +150,7 @@ run 이름은 `{task}_{split}_n{n}m{m}[_k{mod}]_tr{train}[_gfema-a{alpha}-l{lamb
 1. `train_gen_exact_acc`가 1.0에 붙는 step = 암기 완료 시점
 2. 그 뒤 `test_gen_exact_acc`가 급상승하는 step = grokking. **둘의 간격이 delayed generalization** (log-x에서 잘 보임)
 3. `train_loss`는 0인데 `test_loss`가 정체/상승 = 순수 암기 구간. grokking 오면 뒤늦게 급락
-4. `test_gen_valid_acc`가 `test_gen_exact_acc`보다 먼저 1.0 = "재배열해야 한다"는 형식은 배웠고 "어떤 순서인지"는 아직
+4. `test_gen_valid_acc`가 `test_gen_exact_acc`보다 먼저 1.0 = 출력 token들은 맞지만 순서는 아직 틀림
 5. `param_norm`/`embd_norm`이 꺾이는 구간과 test 상승 구간이 겹치는지 = 압축과 일반화의 동행 여부
 6. `test_exact_acc`는 높은데 `test_gen_exact_acc`가 낮다 = 앞 토큰을 틀린 뒤 복구 못 함(오류 누적)
 
@@ -162,10 +165,10 @@ run 이름은 `{task}_{split}_n{n}m{m}[_k{mod}]_tr{train}[_gfema-a{alpha}-l{lamb
 ## 5. 실험 순서 (bash)
 
 ```bash
-# 1) random split × task 3종 × train size 4종
+# 1) random split × task 6종 × train size 4종
 for TR in 100 500 1000 5000; do
   python generate_data.py --n 30 --m 5 --train-count $TR --n-test 4096 --seed 42
-  for T in ascending mod alternating; do
+  for T in ascending mod alternating alt_mod shift_mod shift_alt_mod; do
     python train.py --data-dir data/n30_m5_tr${TR}_te4096_random_s42 --task $T --steps 100000
   done
 done

@@ -18,6 +18,9 @@
 ascending
 mod
 alternating
+alt_mod
+shift_mod
+shift_alt_mod
 ```
 
 각 task는 독립 run으로 학습한다.
@@ -56,6 +59,9 @@ TASK_REGISTRY = {
     "ascending": ascending,
     "mod": mod_sort,
     "alternating": alternating,
+    "alt_mod": alt_mod,
+    "shift_mod": shift_mod,
+    "shift_alt_mod": shift_alt_mod,
 }
 ```
 
@@ -97,6 +103,44 @@ a0, a(m-1), a1, a(m-2), ...
 ```
 
 순서로 출력한다.
+
+## alt_mod
+
+먼저 다음 key로 전체 순위를 계산한다.
+
+```python
+sorted(xs, key=lambda x: (x % modulus, x))
+```
+
+그 순위의 최솟값과 최댓값을 번갈아 출력한다. 예를 들어
+`xs = [1, 2, 3, 4, 5]`, `modulus = 3`이면 순위는
+`[3, 1, 4, 2, 5]`, target은 `[3, 5, 1, 2, 4]`다.
+
+## shift_mod
+
+입력의 첫 token을 sample별 offset으로 사용한다.
+
+```python
+offset = xs[0]
+zs = [(x + offset) % modulus for x in xs]
+target = sorted(zs)
+```
+
+원래 token이 아니라 변환된 token을 출력하며, modulo 충돌에 따른 중복 token을
+허용한다. 첫 token도 변환과 출력에 포함한다. 따라서 이 task는 입력 순서에
+의존한다.
+
+## shift_alt_mod
+
+`shift_mod`와 동일하게 `zs`를 만든 뒤, 정렬된 `zs`의 최솟값과 최댓값을
+번갈아 출력한다.
+
+`shift_mod`, `shift_alt_mod`는 출력 token이 sorting vocabulary 안에 있도록
+다음을 요구한다.
+
+```text
+0 < modulus <= n
+```
 
 ---
 
@@ -472,6 +516,19 @@ python train.py \
   --steps 100000
 ```
 
+추가 task:
+
+```bash
+python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 \
+  --task alt_mod --modulus 5 --steps 100000
+
+python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 \
+  --task shift_mod --modulus 5 --steps 100000
+
+python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 \
+  --task shift_alt_mod --modulus 5 --steps 100000
+```
+
 Grokfast-EMA:
 
 ```bash
@@ -617,15 +674,16 @@ test_gen_valid_acc
 
 ## gen valid accuracy
 
-생성된 `m`개 token이 입력 token들의 정확한 permutation이면 1.
+생성된 `m`개 token의 multiset이 target token의 multiset과 정확히 같으면 1.
 
 판정:
 
 ```python
-sorted(pred) == sorted(input_values)
+sorted(pred) == sorted(target)
 ```
 
-현재 입력에는 중복 값이 없으므로 이 방식으로 판정한다.
+기존 세 task와 `alt_mod`에서는 입력 permutation 판정과 같다. Shift task는
+변환된 target에 중복 token이 생길 수 있으므로 target multiset을 기준으로 한다.
 
 ---
 
@@ -701,7 +759,8 @@ runs/
 runs/
 ├─ ascending_random_n30m5_tr1000_s42/
 ├─ ascending_relation-complete_n30m5_tr1000_s42/
-└─ mod_random_n30m5_k5_tr1000_s42/
+├─ mod_random_n30m5_k5_tr1000_s42/
+└─ shift_alt_mod_random_n30m5_k5_tr1000_s42/
 ```
 
 기존 directory가 존재하면 error.
@@ -876,6 +935,9 @@ seed = 42
 ascending
 mod
 alternating
+alt_mod
+shift_mod
+shift_alt_mod
 ```
 
 을 실행한다.
@@ -932,6 +994,9 @@ test_gen_exact_acc 낮음
 ascending
 mod
 alternating
+alt_mod
+shift_mod
+shift_alt_mod
 
 random split
 relation-complete split
