@@ -23,7 +23,8 @@ def output_loss(logits: torch.Tensor, seqs: torch.Tensor, m: int) -> torch.Tenso
     )
 
 
-@torch.inference_mode()
+# inference_mode tensors conflict with the compiled CUDA training graph after step-0 eval.
+@torch.no_grad()
 def teacher_forced_metrics(
     model, seqs: torch.Tensor, m: int, batch_size: int, device: torch.device
 ) -> Dict[str, float]:
@@ -58,7 +59,7 @@ def teacher_forced_metrics(
     }
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def generate(model, prefix: torch.Tensor, m: int) -> torch.Tensor:
     """prefix: [B, m+2] (BOS x1..xm SEP). greedy 로 정확히 m 개 token 생성."""
     cur = prefix
@@ -69,7 +70,7 @@ def generate(model, prefix: torch.Tensor, m: int) -> torch.Tensor:
     return cur[:, prefix.shape[1] :]
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def generation_metrics(
     model, seqs: torch.Tensor, m: int, batch_size: int, device: torch.device
 ) -> Dict[str, float]:
@@ -105,7 +106,7 @@ def generation_metrics(
     }
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def param_norm(model) -> float:
     seen = {}
     for p in model.parameters():
@@ -115,6 +116,6 @@ def param_norm(model) -> float:
     return math.sqrt(total)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def embd_norm(model) -> float:
     return float(model.wte.weight.detach().float().norm().item())
