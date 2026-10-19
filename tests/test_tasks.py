@@ -8,6 +8,7 @@ from src.tasks import (
     build_targets,
     shift_alt_mod,
     shift_mod,
+    sum_shift,
 )
 
 
@@ -21,6 +22,10 @@ class TaskTests(unittest.TestCase):
 
     def test_shift_alt_mod_alternates_transformed_values(self):
         self.assertEqual(shift_alt_mod([2, 3, 5], modulus=6), [1, 5, 4])
+
+    def test_sum_shift_adds_total_and_keeps_order(self):
+        # 합 = 10 -> [(5+10)%6, (2+10)%6, (3+10)%6]
+        self.assertEqual(sum_shift([5, 2, 3], modulus=6), [3, 0, 1])
 
     def test_shift_mod_preserves_duplicate_transformed_tokens(self):
         self.assertEqual(shift_mod([3, 0, 6], modulus=6), [0, 3, 3])

@@ -1,0 +1,8 @@
+{
+  "n": 70,
+  "m": 7,
+  "train_size": 4096,
+  "test_size": 20000,
+  "split_strategy": "random",
+  "seed": 42
+}

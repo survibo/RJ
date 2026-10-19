@@ -69,6 +69,15 @@ def shift_alt_mod(xs: Sequence[int], modulus: Optional[int] = None) -> List[int]
     return _alternate(sorted(_shifted_values(xs, modulus)))
 
 
+def sum_shift(xs: Sequence[int], modulus: Optional[int] = None) -> List[int]:
+    """전체 입력의 합을 offset으로 더한 나머지를 입력 순서 그대로 출력한다."""
+    modulus = _require_modulus(modulus)
+    if not xs:
+        raise ValueError("sum_shift requires at least one input value")
+    offset = sum(xs)
+    return [(x + offset) % modulus for x in xs]
+
+
 TASK_REGISTRY = {
     "ascending": ascending,
     "mod": mod_sort,
@@ -76,10 +85,12 @@ TASK_REGISTRY = {
     "alt_mod": alt_mod,
     "shift_mod": shift_mod,
     "shift_alt_mod": shift_alt_mod,
+    "sum_shift": sum_shift,
 }
 
-MODULUS_TASKS = frozenset({"mod", "alt_mod", "shift_mod", "shift_alt_mod"})
-SHIFT_TASKS = frozenset({"shift_mod", "shift_alt_mod"})
+MODULUS_TASKS = frozenset({"mod", "alt_mod", "shift_mod", "shift_alt_mod", "sum_shift"})
+# 출력이 [0, modulus) 값이라 modulus <= n 이어야 하는 task
+SHIFT_TASKS = frozenset({"shift_mod", "shift_alt_mod", "sum_shift"})
 
 
 def build_targets(task: str, inputs: np.ndarray, modulus: Optional[int] = None) -> np.ndarray:
