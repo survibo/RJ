@@ -7,6 +7,10 @@
     python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 \
                     --task mod --modulus 5 --steps 100000
 
+    # rule-lab 규칙 조합 (마지막 (x mod p)+1, p 기본값 n)
+    python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 \
+                    --rules "Q:first > I:add,c=3 > R:add" --modulus 17
+
 resume:
     python train.py --resume runs/<run>/ckpt_last.pt --steps 500000
 """
@@ -38,7 +42,15 @@ from src.metrics import (
     teacher_forced_metrics,
 )
 from src.model import GPT, GPTConfig
-from src.tasks import MODULUS_TASKS, SHIFT_TASKS, TASK_REGISTRY, build_targets
+from src.rules import format_rules, parse_rules, rules_hash
+from src.tasks import (
+    MODULUS_TASKS,
+    RULES_TASK,
+    SHIFT_TASKS,
+    TASK_REGISTRY,
+    build_rule_targets,
+    build_targets,
+)
 
 CSV_FIELDS = [
     "step",
@@ -64,6 +76,7 @@ CSV_FIELDS = [
 LOCKED_ARGS = [
     "data_dir",
     "task",
+    "rules",
     "modulus",
     "n_embd",
     "n_head",
@@ -89,7 +102,8 @@ LOCKED_ARGS = [
 ARG_SPECS = [
     ("--data-dir", dict(type=str, default=None)),
     ("--task", dict(type=str, default="ascending", choices=sorted(TASK_REGISTRY))),
-    ("--modulus", dict(type=int, default=5)),
+    ("--rules", dict(type=str, default=None, help='예: "Q:first > I:add,c=3 > R:add"')),
+    ("--modulus", dict(type=int, default=None, help="기존 task 기본 5, --rules 기본 n")),
     ("--n-embd", dict(type=int, default=128)),
     ("--n-head", dict(type=int, default=4)),
     ("--n-layer", dict(type=int, default=2)),
@@ -128,12 +142,17 @@ def build_parser(suppress: bool = False) -> argparse.ArgumentParser:
 
 
 def run_name(cfg: dict) -> str:
+    if cfg["task"] == RULES_TASK:
+        steps = parse_rules(cfg["rules"])
+        head = "rules-" + ".".join(s.code for s in steps) + "-" + rules_hash(steps)
+    else:
+        head = cfg["task"]
     parts = [
-        cfg["task"],
+        head,
         cfg["split_strategy"],
         f"n{cfg['n']}m{cfg['m']}",
     ]
-    if cfg["task"] in MODULUS_TASKS:
+    if cfg["task"] in MODULUS_TASKS or cfg["task"] == RULES_TASK:
         parts.append(f"k{cfg['modulus']}")
     parts.append(f"tr{cfg['train_size']}")
     if cfg.get("grokfast", False):
@@ -154,12 +173,16 @@ def pick_device(choice: str) -> torch.device:
     return torch.device(choice)
 
 
-def load_sequences(data_dir: str, task: str, modulus, meta: dict):
+def load_sequences(data_dir: str, task: str, modulus, meta: dict, rules=None):
     m, n = meta["m"], meta["n"]
+    steps = parse_rules(rules) if task == RULES_TASK else None
     out = {}
     for split in ("train", "test"):
         inputs = read_split(os.path.join(data_dir, f"{split}.txt"), m)
-        targets = build_targets(task, inputs, modulus=modulus)
+        if steps is not None:
+            targets = build_rule_targets(steps, inputs, n, modulus=modulus)
+        else:
+            targets = build_targets(task, inputs, modulus=modulus)
         out[split] = torch.from_numpy(build_sequences(inputs, targets, n))
     return out["train"], out["test"]
 
@@ -260,9 +283,21 @@ def main(argv=None) -> int:
             raise SystemExit(
                 f"error: n_embd ({args.n_embd}) % n_head ({args.n_head}) != 0"
             )
-        if args.task in MODULUS_TASKS and args.modulus <= 0:
+        if args.rules is not None:
+            if "task" in provided:
+                raise SystemExit("error: --task and --rules cannot be used together")
+            try:
+                args.rules = format_rules(parse_rules(args.rules))
+            except ValueError as e:
+                raise SystemExit(f"error: --rules: {e}")
+            args.task = RULES_TASK
+            if args.modulus is None:
+                args.modulus = meta["n"]
+        elif args.modulus is None:
+            args.modulus = 5
+        if args.task in MODULUS_TASKS | {RULES_TASK} and args.modulus <= 0:
             raise SystemExit(f"error: modulus must be > 0, got {args.modulus}")
-        if args.task in SHIFT_TASKS and args.modulus > meta["n"]:
+        if args.task in SHIFT_TASKS | {RULES_TASK} and args.modulus > meta["n"]:
             raise SystemExit(
                 f"error: modulus must be <= n ({meta['n']}) for task '{args.task}', "
                 f"got {args.modulus}"
@@ -287,7 +322,10 @@ def main(argv=None) -> int:
             raise SystemExit("error: checkpoint-every must be > 0")
         config = {
             "task": args.task,
-            "modulus": args.modulus if args.task in MODULUS_TASKS else None,
+            "rules": args.rules,
+            "modulus": args.modulus
+            if args.task in MODULUS_TASKS or args.task == RULES_TASK
+            else None,
             "n": meta["n"],
             "m": meta["m"],
             "train_size": meta["train_size"],
@@ -318,13 +356,22 @@ def main(argv=None) -> int:
         run_dir = os.path.join(args.runs_dir, run_name(config))
         if os.path.exists(run_dir):
             raise SystemExit(f"error: run directory already exists: {run_dir}")
+
+    n, m = config["n"], config["m"]
+    modulus = config["modulus"]
+
+    # 규칙 계산이 실패해도 빈 run 디렉토리가 남지 않도록 target 을 먼저 만든다.
+    try:
+        train_seqs, test_seqs = load_sequences(
+            config["data_dir"], config["task"], modulus, meta, config.get("rules")
+        )
+    except ValueError as e:
+        raise SystemExit(f"error: cannot build targets: {e}")
+    if ckpt is None:
         os.makedirs(run_dir)
         with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
             f.write("\n")
-
-    n, m = config["n"], config["m"]
-    modulus = config["modulus"]
     device = pick_device(args.device)
 
     requested_precision = config["precision"]
@@ -346,9 +393,6 @@ def main(argv=None) -> int:
         torch.cuda.manual_seed_all(seed)
 
     # ------------------------------------------------------------------- data
-    train_seqs, test_seqs = load_sequences(
-        config["data_dir"], config["task"], modulus, meta
-    )
     train_seqs = train_seqs.to(device)
     test_seqs = test_seqs.to(device)
     train_size = train_seqs.shape[0]
@@ -425,6 +469,8 @@ def main(argv=None) -> int:
     print(f"run_dir   : {run_dir}")
     print(f"device    : {device}")
     print(f"task      : {config['task']} (modulus={modulus})")
+    if config.get("rules"):
+        print(f"rules     : {config['rules']}")
     print(f"data      : {config['data_dir']}  train={train_size} test={test_seqs.shape[0]}")
     print(f"eval subs : train={len(train_eval_idx)} test={len(test_eval_idx)}")
     print(f"params    : {model.num_params()}")

@@ -103,7 +103,8 @@ python plot.py "runs/*/metrics.csv" --out runs/grokking.png \
 |---|---|---|
 | `--data-dir` | — | dataset 경로. `--resume` 없으면 필수 |
 | `--task` | ascending | `ascending` / `mod` / `alternating` / `alt_mod` / `shift_mod` / `shift_alt_mod` |
-| `--modulus` | 5 | modulo task 전용. run 이름에 `k5`로 들어감. shift task는 `modulus <= n` 필요 |
+| `--rules` | — | rule-lab 규칙 조합. `--task`와 같이 못 씀. 아래 "규칙 조합" 참고 |
+| `--modulus` | 5 (`--rules`면 n) | modulo task 전용. run 이름에 `k5`로 들어감. shift task와 `--rules`는 `modulus <= n` 필요 |
 | `--n-embd` / `--n-head` / `--n-layer` | 128 / 4 / 2 | `n_embd % n_head == 0` 필요. MLP hidden = `4*n_embd` |
 | `--batch-size` | 512 | 매 step 복원추출. train set보다 커도 됨 |
 | `--lr` | 1e-3 | AdamW |
@@ -125,6 +126,28 @@ python plot.py "runs/*/metrics.csv" --out runs/grokking.png \
 | `--device` | auto | `auto` / `cpu` / `cuda` |
 
 run 이름은 `{task}_{split}_n{n}m{m}[_k{mod}]_tr{train}[_gfema-a{alpha}-l{lambda}][_gfstart{step}]_s{seed}`. **이미 있으면 error** — 지우거나 `--runs-dir`를 바꾼다. dropout 0, betas (0.9, 0.98), 단일 GPU 기준이다. CUDA 기본값은 BF16 autocast, compiled model, fused AdamW이고 CPU는 FP32 eager mode다. Grokfast EMA 상태도 checkpoint에 저장되므로 resume 시 이어진다.
+
+### 규칙 조합 (`--rules`)
+
+`rule-lab.html`의 규칙 23개를 순서대로 잇는다. 형식은 `규칙코드:모드,파라미터=값`을 `>`로 연결.
+
+```bash
+python train.py --data-dir data/n70_m7_tr8192_te20000_random_s42 \
+  --rules "Q:first > I:add,c=3 > B:left,k=8 > R:add" --modulus 37
+```
+
+* rule-lab.html의 **명령어 복사** 버튼이 지금 조합을 `--rules "..."` 형태로 복사한다. `train.py` 명령 뒤에 그대로 붙여넣으면 된다 (rule-lab은 마지막 모듈러가 n이니 같은 결과를 원하면 `--modulus`는 생략).
+* 모드·파라미터를 생략하면 rule-lab 기본값 (`"Q > I > R"`도 됨). 코드 대소문자 무관.
+* 그 규칙이 쓰지 않는 파라미터를 주면 error (오타 방지).
+* AO 주기 상수는 `/`로 구분: `AO:add,period=2/5/3`.
+* Z / AB / AJ 변환: `fn=keep|add|mul|pow|mod|reverse|sum|product`, `add/mul/pow`면 `fc=상수`.
+* 계산: token `t` → 값 `t+1` (1..n), 규칙 적용 후 `((x-1) mod p) + 1` (1..p) → token 0..p-1. `p = --modulus`, 기본 n.
+  범위 안 값은 그대로, 넘은 값만 감는다. 규칙 M과 `fn=mod`는 같은 식에 항상 n을 쓴다.
+* 그래서 `A:asc`만 쓰면 `--task ascending`과 같은 target이 나온다.
+* 중간값 10,000자리, 소인수분해 한도 등 rule-lab과 같은 한도를 넘으면 run 디렉토리를 만들기 전에 error.
+* config.json에는 정규화된 문자열이 저장되고, run 이름은 `rules-{코드들}-{해시8}_...` (예: `rules-Q.I.B.R-83369158_random_n70m7_k37_tr8192_s42`).
+* rule-lab과 결과가 같은지는 `tests/test_rules.py`가 확인한다. rule-lab.html을 고치면 정답 파일을 다시 만든다:
+  `node tests/make_rule_golden.js > tests/fixtures/rule_lab_golden.json`
 
 ### plot.py
 

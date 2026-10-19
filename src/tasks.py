@@ -4,11 +4,16 @@
 
 공통 인터페이스:
     target = TASK_REGISTRY[task](input_values, modulus=modulus)
+
+규칙 조합 task (src/rules.py):
+    targets = build_rule_targets(parse_rules(spec), inputs, n, modulus)
 """
 
 from typing import List, Optional, Sequence
 
 import numpy as np
+
+from src.rules import Step, run_rules
 
 
 def _alternate(values: Sequence[int]) -> List[int]:
@@ -91,6 +96,27 @@ TASK_REGISTRY = {
 MODULUS_TASKS = frozenset({"mod", "alt_mod", "shift_mod", "shift_alt_mod", "sum_shift"})
 # 출력이 [0, modulus) 값이라 modulus <= n 이어야 하는 task
 SHIFT_TASKS = frozenset({"shift_mod", "shift_alt_mod", "sum_shift"})
+# --rules 로 만든 규칙 조합 task 의 이름. 출력은 [0, modulus) 라 modulus <= n.
+RULES_TASK = "rules"
+
+
+def build_rule_targets(
+    steps: Sequence[Step], inputs: np.ndarray, n: int, modulus: Optional[int] = None
+) -> np.ndarray:
+    """규칙 조합 task. inputs: [N, m] token(0..n-1) -> targets: [N, m] token(0..p-1)
+
+    rule-lab 은 값 1..n 을 쓰므로 값 = token + 1 로 계산하고 결과 값 1..p 를 token 0..p-1 로 돌린다.
+    마지막이 ((x-1) mod p)+1 이라 규칙이 값을 바꾸지 않으면 token 도 (p = n 일 때) 그대로다.
+    """
+    out = np.empty_like(inputs)
+    for i, row in enumerate(inputs):
+        values = [int(v) + 1 for v in row]
+        try:
+            ys = run_rules(values, steps, n, modulus)
+        except ValueError as e:
+            raise ValueError(f"input {values}: {e}") from e
+        out[i] = [y - 1 for y in ys]
+    return out
 
 
 def build_targets(task: str, inputs: np.ndarray, modulus: Optional[int] = None) -> np.ndarray:
