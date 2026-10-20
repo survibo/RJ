@@ -11,6 +11,10 @@
     python train.py --data-dir data/n30_m5_tr1000_te4096_random_s42 \
                     --rules "Q:first > I:add,c=3 > R:add" --modulus 17
 
+    # 배선 규칙 가족 (RESEARCH_PLAN.md). prefix-LM, 출력 (a+b) mod n
+    python train.py --data-dir data/n50_m5_tr21188_te10000_random_s42 \
+                    --wiring c3 --op add --prefix-lm
+
 resume:
     python train.py --resume runs/<run>/ckpt_last.pt --steps 500000
 """
@@ -37,20 +41,27 @@ from src.data import (
 from src.metrics import (
     embd_norm,
     generation_metrics,
+    noise_metrics,
     output_loss,
     param_norm,
+    symmetry_metrics,
     teacher_forced_metrics,
+    unique_frac,
 )
 from src.model import GPT, GPTConfig
+from src.noise import corrupt_targets, keep_rows
 from src.rules import format_rules, parse_rules, rules_hash
+from src.symmetry import describe
 from src.tasks import (
     MODULUS_TASKS,
     RULES_TASK,
     SHIFT_TASKS,
     TASK_REGISTRY,
-    build_rule_targets,
-    build_targets,
+    WIRE_TASK,
+    build_fn_targets,
+    make_target_fn,
 )
+from src.wiring import OPS, parse_wiring, wiring_name
 
 CSV_FIELDS = [
     "step",
@@ -70,6 +81,13 @@ CSV_FIELDS = [
     "test_gen_valid_acc",
     "param_norm",
     "embd_norm",
+    "test_sym_token_viol",
+    "test_sym_exact_viol",
+    "test_pred_unique_frac",
+    "noisy_mem_exact",
+    "noisy_rule_exact",
+    "noisy_mem_tok",
+    "noisy_rule_tok",
 ]
 
 # resume 시 변경할 수 없는 항목 (--steps 만 연장 가능)
@@ -77,6 +95,9 @@ LOCKED_ARGS = [
     "data_dir",
     "task",
     "rules",
+    "wiring",
+    "op",
+    "op_seed",
     "modulus",
     "n_embd",
     "n_head",
@@ -88,6 +109,9 @@ LOCKED_ARGS = [
     "precision",
     "compile",
     "fused_adamw",
+    "prefix_lm",
+    "input_pos",
+    "sym_metrics",
     "grokfast",
     "grokfast_alpha",
     "grokfast_lamb",
@@ -96,6 +120,9 @@ LOCKED_ARGS = [
     "checkpoint_every",
     "n_eval",
     "seed",
+    "label_noise",
+    "drop_frac",
+    "noise_seed",
 ]
 
 
@@ -103,7 +130,10 @@ ARG_SPECS = [
     ("--data-dir", dict(type=str, default=None)),
     ("--task", dict(type=str, default="ascending", choices=sorted(TASK_REGISTRY))),
     ("--rules", dict(type=str, default=None, help='예: "Q:first > I:add,c=3 > R:add"')),
-    ("--modulus", dict(type=int, default=None, help="기존 task 기본 5, --rules 기본 n")),
+    ("--wiring", dict(type=str, default=None, help="배선 규칙. 예: sortnbr, sum, c3, perm:1,0,2,3,4")),
+    ("--op", dict(type=str, default="add", choices=list(OPS), help="--wiring 연산 T")),
+    ("--op-seed", dict(type=int, default=0, help="--op table 의 무작위 표 seed")),
+    ("--modulus", dict(type=int, default=None, help="기존 task 기본 5, --rules/--wiring 기본 n")),
     ("--n-embd", dict(type=int, default=128)),
     ("--n-head", dict(type=int, default=4)),
     ("--n-layer", dict(type=int, default=2)),
@@ -114,6 +144,12 @@ ARG_SPECS = [
     ("--precision", dict(type=str, default="auto", choices=["auto", "fp32", "bf16"])),
     ("--compile", dict(action=argparse.BooleanOptionalAction, default=True)),
     ("--fused-adamw", dict(action=argparse.BooleanOptionalAction, default=True)),
+    ("--prefix-lm", dict(action=argparse.BooleanOptionalAction, default=False,
+                         help="입력 prefix (BOS x SEP) 끼리 양방향 attention")),
+    ("--input-pos", dict(action=argparse.BooleanOptionalAction, default=True,
+                         help="--no-input-pos: 입력 칸 위치 embedding 제거 (--prefix-lm 필요)")),
+    ("--sym-metrics", dict(action=argparse.BooleanOptionalAction, default=True,
+                           help="test 대칭 위반 점수 로깅")),
     ("--grokfast", dict(action="store_true", default=False)),
     ("--grokfast-alpha", dict(type=float, default=0.98)),
     ("--grokfast-lamb", dict(type=float, default=2.0)),
@@ -123,6 +159,11 @@ ARG_SPECS = [
     ("--checkpoint-every", dict(type=int, default=2500)),
     ("--n-eval", dict(type=int, default=4096)),
     ("--seed", dict(type=int, default=42)),
+    ("--label-noise", dict(type=float, default=0.0,
+                           help="train 행의 이 비율만큼 출력 칸 하나를 오답으로 바꾼다")),
+    ("--drop-frac", dict(type=float, default=0.0,
+                         help="삭제 대조군: --label-noise 가 바꿀 행을 대신 빼 버린다")),
+    ("--noise-seed", dict(type=int, default=0, help="오답/삭제 행을 고르는 seed (모델 seed 와 별개)")),
     ("--runs-dir", dict(type=str, default="runs")),
     ("--resume", dict(type=str, default=None, help="path to ckpt_last.pt")),
     ("--device", dict(type=str, default="auto", choices=["auto", "cpu", "cuda"])),
@@ -145,6 +186,10 @@ def run_name(cfg: dict) -> str:
     if cfg["task"] == RULES_TASK:
         steps = parse_rules(cfg["rules"])
         head = "rules-" + ".".join(s.code for s in steps) + "-" + rules_hash(steps)
+    elif cfg["task"] == WIRE_TASK:
+        head = f"wire-{wiring_name(cfg['wiring'])}-{cfg['op']}"
+        if cfg["op"] == "table":
+            head += f"{cfg['op_seed']}"
     else:
         head = cfg["task"]
     parts = [
@@ -152,15 +197,23 @@ def run_name(cfg: dict) -> str:
         cfg["split_strategy"],
         f"n{cfg['n']}m{cfg['m']}",
     ]
-    if cfg["task"] in MODULUS_TASKS or cfg["task"] == RULES_TASK:
+    if cfg["task"] in MODULUS_TASKS or cfg["task"] in (RULES_TASK, WIRE_TASK):
         parts.append(f"k{cfg['modulus']}")
     parts.append(f"tr{cfg['train_size']}")
+    if cfg.get("prefix_lm", False):
+        parts.append("plm")
+    if not cfg.get("input_pos", True):
+        parts.append("nopos")
     if cfg.get("grokfast", False):
         parts.append(
             f"gfema-a{cfg['grokfast_alpha']:g}-l{cfg['grokfast_lamb']:g}"
         )
         if cfg["grokfast_start_step"] > 0:
             parts.append(f"gfstart{cfg['grokfast_start_step']}")
+    if cfg.get("label_noise"):
+        parts.append(f"ln{cfg['label_noise']:g}-ns{cfg['noise_seed']}")
+    if cfg.get("drop_frac"):
+        parts.append(f"drop{cfg['drop_frac']:g}-ns{cfg['noise_seed']}")
     parts.append(f"s{cfg['seed']}")
     return "_".join(parts)
 
@@ -173,16 +226,25 @@ def pick_device(choice: str) -> torch.device:
     return torch.device(choice)
 
 
-def load_sequences(data_dir: str, task: str, modulus, meta: dict, rules=None):
+def config_target_fn(config: dict):
+    return make_target_fn(
+        config["task"],
+        config["n"],
+        config["m"],
+        modulus=config["modulus"],
+        rules=config.get("rules"),
+        wiring=config.get("wiring"),
+        op=config.get("op") or "add",
+        op_seed=config.get("op_seed") or 0,
+    )
+
+
+def load_sequences(data_dir: str, target_fn, meta: dict):
     m, n = meta["m"], meta["n"]
-    steps = parse_rules(rules) if task == RULES_TASK else None
     out = {}
     for split in ("train", "test"):
         inputs = read_split(os.path.join(data_dir, f"{split}.txt"), m)
-        if steps is not None:
-            targets = build_rule_targets(steps, inputs, n, modulus=modulus)
-        else:
-            targets = build_targets(task, inputs, modulus=modulus)
+        targets = build_fn_targets(target_fn, inputs)
         out[split] = torch.from_numpy(build_sequences(inputs, targets, n))
     return out["train"], out["test"]
 
@@ -201,11 +263,16 @@ def fmt(v) -> str:
 
 def append_csv_row(path: str, row: dict) -> None:
     exists = os.path.exists(path) and os.path.getsize(path) > 0
+    fields = CSV_FIELDS
+    if exists:
+        # 예전 열 구성으로 만든 CSV 를 resume 해도 열이 어긋나지 않게 기존 header 를 따른다.
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            fields = next(csv.reader(f))
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         if not exists:
             writer.writeheader()
-        writer.writerow({k: fmt(row.get(k)) for k in CSV_FIELDS})
+        writer.writerow({k: fmt(row.get(k)) for k in fields})
 
 
 def save_checkpoint(path: str, payload: dict) -> None:
@@ -283,7 +350,19 @@ def main(argv=None) -> int:
             raise SystemExit(
                 f"error: n_embd ({args.n_embd}) % n_head ({args.n_head}) != 0"
             )
-        if args.rules is not None:
+        if args.rules is not None and args.wiring is not None:
+            raise SystemExit("error: --rules and --wiring cannot be used together")
+        if args.wiring is not None:
+            if "task" in provided:
+                raise SystemExit("error: --task and --wiring cannot be used together")
+            try:
+                parse_wiring(args.wiring, meta["m"])
+            except ValueError as e:
+                raise SystemExit(f"error: --wiring: {e}")
+            args.task = WIRE_TASK
+            if args.modulus is None:
+                args.modulus = meta["n"]
+        elif args.rules is not None:
             if "task" in provided:
                 raise SystemExit("error: --task and --rules cannot be used together")
             try:
@@ -295,9 +374,9 @@ def main(argv=None) -> int:
                 args.modulus = meta["n"]
         elif args.modulus is None:
             args.modulus = 5
-        if args.task in MODULUS_TASKS | {RULES_TASK} and args.modulus <= 0:
+        if args.task in MODULUS_TASKS | {RULES_TASK, WIRE_TASK} and args.modulus <= 0:
             raise SystemExit(f"error: modulus must be > 0, got {args.modulus}")
-        if args.task in SHIFT_TASKS | {RULES_TASK} and args.modulus > meta["n"]:
+        if args.task in SHIFT_TASKS | {RULES_TASK, WIRE_TASK} and args.modulus > meta["n"]:
             raise SystemExit(
                 f"error: modulus must be <= n ({meta['n']}) for task '{args.task}', "
                 f"got {args.modulus}"
@@ -316,6 +395,16 @@ def main(argv=None) -> int:
                 "error: grokfast start step must be >= 0, "
                 f"got {args.grokfast_start_step}"
             )
+        if not args.input_pos and not args.prefix_lm:
+            raise SystemExit("error: --no-input-pos requires --prefix-lm")
+        for name in ("label_noise", "drop_frac"):
+            if not 0.0 <= getattr(args, name) < 1.0:
+                raise SystemExit(
+                    f"error: {name.replace('_', '-')} must satisfy 0 <= x < 1, "
+                    f"got {getattr(args, name)}"
+                )
+        if args.label_noise > 0 and args.drop_frac > 0:
+            raise SystemExit("error: --label-noise and --drop-frac cannot be used together")
         if args.eval_every <= 0:
             raise SystemExit("error: eval-every must be > 0")
         if args.checkpoint_every <= 0:
@@ -323,8 +412,11 @@ def main(argv=None) -> int:
         config = {
             "task": args.task,
             "rules": args.rules,
+            "wiring": args.wiring,
+            "op": args.op if args.task == WIRE_TASK else None,
+            "op_seed": args.op_seed if args.task == WIRE_TASK and args.op == "table" else None,
             "modulus": args.modulus
-            if args.task in MODULUS_TASKS or args.task == RULES_TASK
+            if args.task in MODULUS_TASKS or args.task in (RULES_TASK, WIRE_TASK)
             else None,
             "n": meta["n"],
             "m": meta["m"],
@@ -343,6 +435,9 @@ def main(argv=None) -> int:
             "precision": args.precision,
             "compile": args.compile,
             "fused_adamw": args.fused_adamw,
+            "prefix_lm": args.prefix_lm,
+            "input_pos": args.input_pos,
+            "sym_metrics": args.sym_metrics,
             "grokfast": args.grokfast,
             "grokfast_alpha": args.grokfast_alpha,
             "grokfast_lamb": args.grokfast_lamb,
@@ -351,6 +446,9 @@ def main(argv=None) -> int:
             "eval_every": args.eval_every,
             "checkpoint_every": args.checkpoint_every,
             "n_eval": args.n_eval,
+            "label_noise": args.label_noise,
+            "drop_frac": args.drop_frac,
+            "noise_seed": args.noise_seed,
             "data_dir": args.data_dir,
         }
         run_dir = os.path.join(args.runs_dir, run_name(config))
@@ -362,16 +460,55 @@ def main(argv=None) -> int:
 
     # 규칙 계산이 실패해도 빈 run 디렉토리가 남지 않도록 target 을 먼저 만든다.
     try:
-        train_seqs, test_seqs = load_sequences(
-            config["data_dir"], config["task"], modulus, meta, config.get("rules")
-        )
+        target_fn = config_target_fn(config)
+        train_seqs, test_seqs = load_sequences(config["data_dir"], target_fn, meta)
+        # 규칙의 대칭 (순열 m! 개 전수 검사). 대칭 위반 점수는 이 군에 속한 순열로만 잰다.
+        symmetry = describe(target_fn, n, m, seed=config["seed"])
     except ValueError as e:
         raise SystemExit(f"error: cannot build targets: {e}")
+
+    # 오답 섞기 / 삭제 대조군. (frac, noise_seed) 로 결정되므로 resume 때도 똑같이 다시 만든다.
+    label_noise = config.get("label_noise") or 0.0
+    drop_frac = config.get("drop_frac") or 0.0
+    noise_seed = config.get("noise_seed") or 0
+    noisy_rows = np.zeros(0, dtype=np.int64)
+    noisy_pos = np.zeros(0, dtype=np.int64)
+    clean_targets = train_seqs[:, m + 2 :].clone()
+    if label_noise > 0:
+        if config["task"] in SHIFT_TASKS | {RULES_TASK, WIRE_TASK}:
+            out_range = modulus
+        else:
+            out_range = n
+        wrong, noisy_rows, noisy_pos = corrupt_targets(
+            clean_targets.numpy(), label_noise, out_range, noise_seed
+        )
+        train_seqs[:, m + 2 :] = torch.from_numpy(wrong)
+    elif drop_frac > 0:
+        keep = torch.from_numpy(keep_rows(train_seqs.shape[0], drop_frac, noise_seed))
+        train_seqs = train_seqs[keep]
+        clean_targets = clean_targets[keep]
     if ckpt is None:
         os.makedirs(run_dir)
         with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
             f.write("\n")
+        with open(os.path.join(run_dir, "symmetry.json"), "w", encoding="utf-8") as f:
+            json.dump(symmetry, f)
+            f.write("\n")
+        if label_noise > 0 or drop_frac > 0:
+            with open(os.path.join(run_dir, "noise.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "label_noise": label_noise,
+                        "drop_frac": drop_frac,
+                        "noise_seed": noise_seed,
+                        "train_size": int(train_seqs.shape[0]),
+                        "noisy_rows": noisy_rows.tolist(),
+                        "noisy_pos": noisy_pos.tolist(),
+                    },
+                    f,
+                )
+                f.write("\n")
     device = pick_device(args.device)
 
     requested_precision = config["precision"]
@@ -405,6 +542,8 @@ def main(argv=None) -> int:
         n_head=config["n_head"],
         n_layer=config["n_layer"],
         dropout=0.0,
+        prefix_len=m + 2 if config.get("prefix_lm", False) else 0,
+        input_pos=config.get("input_pos", True),
     )
     model = GPT(model_cfg).to(device)
     optimizer = torch.optim.AdamW(
@@ -453,11 +592,27 @@ def main(argv=None) -> int:
                     name: value.to(device) for name, value in saved_ema.items()
                 }
     else:
-        train_eval_idx = pick_eval_indices(train_size, config["n_eval"], eval_rng)
+        # 오답이 있으면 train 지표는 정답 행에서만 잰다 (오답 행은 noisy_* 지표로 따로 잰다).
+        clean_pool = np.setdiff1d(np.arange(train_size, dtype=np.int64), noisy_rows)
+        train_eval_idx = clean_pool[pick_eval_indices(len(clean_pool), config["n_eval"], eval_rng)]
         test_eval_idx = pick_eval_indices(test_seqs.shape[0], config["n_eval"], eval_rng)
 
     train_eval = train_seqs[torch.from_numpy(train_eval_idx).to(device)]
     test_eval = test_seqs[torch.from_numpy(test_eval_idx).to(device)]
+
+    noisy_sel = pick_eval_indices(len(noisy_rows), config["n_eval"], np.random.default_rng(seed + 3))
+    noisy_eval = train_seqs[torch.from_numpy(noisy_rows[noisy_sel]).to(device)]
+    noisy_clean = clean_targets[torch.from_numpy(noisy_rows[noisy_sel])].to(device)
+    noisy_pos_t = torch.from_numpy(noisy_pos[noisy_sel]).to(device)
+
+    # test 행마다 대칭군에서 항등이 아닌 순열 하나를 고정해 둔다 (seed 로 재현, resume 에도 동일).
+    sym_kind = symmetry["kind"]
+    sym_group = [p for p in symmetry["group"] if p != list(range(m))]
+    use_sym = config.get("sym_metrics", True) and sym_kind != "none" and len(sym_group) > 0
+    sym_perms = None
+    if use_sym:
+        pick = np.random.default_rng(seed + 2).integers(len(sym_group), size=len(test_eval_idx))
+        sym_perms = torch.as_tensor(np.asarray(sym_group)[pick], dtype=torch.long, device=device)
 
     if use_compile:
         model.compile(mode="reduce-overhead")
@@ -469,10 +624,24 @@ def main(argv=None) -> int:
     print(f"run_dir   : {run_dir}")
     print(f"device    : {device}")
     print(f"task      : {config['task']} (modulus={modulus})")
+    if config.get("wiring"):
+        print(f"wiring    : {config['wiring']} op={config['op']}")
+    print(
+        f"symmetry  : {sym_kind} |G|={symmetry['group_size']} "
+        f"dep={symmetry['dependency_range']:.2f}"
+    )
+    print(
+        f"attention : {'prefix-LM' if config.get('prefix_lm') else 'causal'}"
+        f"{'' if config.get('input_pos', True) else ', no input pos'}"
+    )
     if config.get("rules"):
         print(f"rules     : {config['rules']}")
     print(f"data      : {config['data_dir']}  train={train_size} test={test_seqs.shape[0]}")
     print(f"eval subs : train={len(train_eval_idx)} test={len(test_eval_idx)}")
+    if label_noise > 0:
+        print(f"noise     : label_noise={label_noise:g} rows={len(noisy_rows)} seed={noise_seed}")
+    if drop_frac > 0:
+        print(f"noise     : drop_frac={drop_frac:g} kept={train_size} seed={noise_seed}")
     print(f"params    : {model.num_params()}")
     print(f"precision : {'bf16' if use_bf16 else 'fp32'}")
     print(f"compile   : {use_compile}")
@@ -497,7 +666,24 @@ def main(argv=None) -> int:
             tf_tr = teacher_forced_metrics(model, train_eval, m, eval_bs, device)
             tf_te = teacher_forced_metrics(model, test_eval, m, eval_bs, device)
             gen_tr = generation_metrics(model, train_eval, m, eval_bs, device)
-            gen_te = generation_metrics(model, test_eval, m, eval_bs, device)
+            gen_te = generation_metrics(
+                model, test_eval, m, eval_bs, device, return_preds=True
+            )
+            noisy = {}
+            if noisy_eval.shape[0] > 0:
+                gen_no = generation_metrics(
+                    model, noisy_eval, m, eval_bs, device, return_preds=True
+                )
+                noisy = noise_metrics(
+                    gen_no["preds"], noisy_eval[:, m + 2 :], noisy_clean, noisy_pos_t
+                )
+            sym = (
+                symmetry_metrics(
+                    model, test_eval, gen_te["preds"], sym_perms, sym_kind, m, eval_bs, device
+                )
+                if use_sym
+                else {}
+            )
         row = {
             "step": global_step,
             "wall_time": time.time() - start_time,
@@ -516,13 +702,26 @@ def main(argv=None) -> int:
             "test_gen_valid_acc": gen_te["gen_valid_acc"],
             "param_norm": param_norm(model),
             "embd_norm": embd_norm(model),
+            "test_sym_token_viol": sym.get("sym_token_viol"),
+            "test_sym_exact_viol": sym.get("sym_exact_viol"),
+            "test_pred_unique_frac": unique_frac(gen_te["preds"]),
+            "noisy_mem_exact": noisy.get("mem_exact"),
+            "noisy_rule_exact": noisy.get("rule_exact"),
+            "noisy_mem_tok": noisy.get("mem_tok"),
+            "noisy_rule_tok": noisy.get("rule_tok"),
         }
         append_csv_row(metrics_path, row)
         print(
             f"step {global_step:>7d} | loss {row['train_loss']:.4f}/{row['test_loss']:.4f} "
             f"| gen_exact {row['train_gen_exact_acc']:.3f}/{row['test_gen_exact_acc']:.3f} "
             f"| gen_valid {row['train_gen_valid_acc']:.3f}/{row['test_gen_valid_acc']:.3f} "
-            f"| pnorm {row['param_norm']:.2f} | {row['wall_time']:.0f}s",
+            + (f"| symviol {row['test_sym_exact_viol']:.3f} " if use_sym else "")
+            + (
+                f"| noisy mem/rule {noisy['mem_exact']:.3f}/{noisy['rule_exact']:.3f} "
+                if noisy
+                else ""
+            )
+            + f"| pnorm {row['param_norm']:.2f} | {row['wall_time']:.0f}s",
             flush=True,
         )
 

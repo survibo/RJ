@@ -104,7 +104,12 @@ python plot.py "runs/*/metrics.csv" --out runs/grokking.png \
 | `--data-dir` | — | dataset 경로. `--resume` 없으면 필수 |
 | `--task` | ascending | `ascending` / `mod` / `alternating` / `alt_mod` / `shift_mod` / `shift_alt_mod` |
 | `--rules` | — | rule-lab 규칙 조합. `--task`와 같이 못 씀. 아래 "규칙 조합" 참고 |
-| `--modulus` | 5 (`--rules`면 n) | modulo task 전용. run 이름에 `k5`로 들어감. shift task와 `--rules`는 `modulus <= n` 필요 |
+| `--wiring` | — | 배선 규칙 가족. `--task`/`--rules`와 같이 못 씀. 아래 "배선 규칙" 참고 |
+| `--op` / `--op-seed` | add / 0 | `--wiring`의 연산 T. `add` = (a+b) mod p, `table` = seed로 뽑은 무작위 연산표 |
+| `--modulus` | 5 (`--rules`/`--wiring`이면 n) | modulo task 전용. run 이름에 `k5`로 들어감. shift task와 `--rules`/`--wiring`은 `modulus <= n` 필요 |
+| `--prefix-lm` | 꺼짐 | 입력 prefix (BOS x SEP) 끼리 양방향 attention. 출력은 그대로 causal. run 이름에 `plm` |
+| `--input-pos` / `--no-input-pos` | 켜짐 | 끄면 입력 칸 x1..xm이 같은 위치 embedding을 받아 모델이 입력 순서에 불변이 된다. `--prefix-lm` 필요. run 이름에 `nopos` |
+| `--sym-metrics` / `--no-sym-metrics` | 켜짐 | test 대칭 위반 점수 로깅 (규칙에 대칭이 있을 때만) |
 | `--n-embd` / `--n-head` / `--n-layer` | 128 / 4 / 2 | `n_embd % n_head == 0` 필요. MLP hidden = `4*n_embd` |
 | `--batch-size` | 512 | 매 step 복원추출. train set보다 커도 됨 |
 | `--lr` | 1e-3 | AdamW |
@@ -149,6 +154,40 @@ python train.py --data-dir data/n70_m7_tr8192_te20000_random_s42 \
 * rule-lab과 결과가 같은지는 `tests/test_rules.py`가 확인한다. rule-lab.html을 고치면 정답 파일을 다시 만든다:
   `node tests/make_rule_golden.js > tests/fixtures/rule_lab_golden.json`
 
+### 배선 규칙 (`--wiring`)
+
+`RESEARCH_PLAN.md`의 규칙 가족. 모두 `y_i = T(x_i, 참조값_i)` 꼴이고 참조하는 칸만 다르다. token 공간(0..n-1)에서 계산한다.
+
+| `--wiring` | 규칙 | 대칭 (m=5) |
+|---|---|---|
+| `sortnbr` | T(s_i, s_{i+1}), s = 정렬된 x (순환) | 불변 120 |
+| `sum` | T(x_i, Σx mod n) | 등변 120 |
+| `first` | T(x_i, x_0) | 등변 24 |
+| `t2` `t22` `c3` `c32` `c4` `c5r` | T(x_i, x_{π(i)}), π preset (`src/wiring.py`) | 등변 12 / 8 / 6 / 6 / 4 / 5 |
+| `nbr` | T(x_i, x_{i+1}) (순환) | 등변 5 |
+| `nbrpos` | T(x_i, x_{i+1}) + i | 없음 1 |
+| `perm:a,b,...` | 임의의 π (0-based) | 자동 계산 |
+
+```bash
+python train.py --data-dir data/n50_m5_tr21188_te10000_random_s42 --wiring c3 --prefix-lm
+python train.py --data-dir data/n50_m5_tr21188_te10000_random_s42 --wiring sortnbr --prefix-lm --no-input-pos
+```
+
+* 시작할 때 규칙의 대칭군을 순열 m!개 전수 검사로 계산해 run 디렉토리의 `symmetry.json`에 저장한다 (`kind`, `group_size`, `group`, `dependency_range`). `--rules`/`--task` run도 같이 저장된다.
+* 위 표의 값은 `tests/test_wiring.py`가 확인한다.
+* run 이름은 `wire-{배선}-{op}_...` (예: `wire-c3-add_random_n50m5_k50_tr21188_plm_s42`). 모델 크기는 이름에 안 들어가므로 크기를 바꿔 비교할 때는 `--runs-dir`를 나눈다.
+
+### 파일럿 / 요약
+
+```bash
+bash scripts/pilot.sh data                         # n=50 m=5, fraction 0.1/0.3/1/3% 데이터
+JOBS=4 bash scripts/pilot.sh model                 # 모델 크기 3개 비교
+MODEL="2 128 4 1e-3" bash scripts/pilot.sh fraction
+python summarize.py runs_pilot --out runs_pilot/summary.csv
+```
+
+`summarize.py`는 run마다 t_fit, t_gen, t_sym, delay(t_gen − t_fit), lead(t_gen − t_sym), censored(예산 안에 t_gen 미도달)를 계산한다. 기준값은 `--fit 0.99 --gen 0.95 --sym 0.05 --uniq 0.5`.
+
 ### plot.py
 
 `pattern`(glob 여러 개 가능), `--out`, `--x-scale`(기본 log, step 0 행 생략), `--norm-y-scale`(두 norm 스케일 차가 크면 log), `--dpi`. run은 색, metric은 선 스타일로 구분.
@@ -165,6 +204,8 @@ python train.py --data-dir data/n70_m7_tr8192_te20000_random_s42 \
 | `*_gen_token_acc` / `*_gen_exact_acc` | greedy 생성 기준 같은 지표 |
 | `*_gen_valid_acc` | 생성 결과와 target의 token multiset이 같으면 1 |
 | `param_norm` `embd_norm` | 전체 파라미터 / token embedding L2 norm |
+| `test_sym_token_viol` / `test_sym_exact_viol` | test 입력을 규칙의 대칭군 순열로 섞었을 때 모델 출력이 대칭 관계(불변: 같음, 등변: 똑같이 섞임)를 어긴 칸 / 수열 비율. **정답 target을 쓰지 않는다** |
+| `test_pred_unique_frac` | test 생성 결과 중 서로 다른 수열의 비율. 상수 출력처럼 위반 점수만 0인 사소한 해를 가려낸다 |
 
 **주 지표는 `test_gen_exact_acc`.** teacher-forced는 정답 prefix를 보여준 측정이라 낙관적이다.
 

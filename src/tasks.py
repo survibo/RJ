@@ -7,13 +7,17 @@
 
 규칙 조합 task (src/rules.py):
     targets = build_rule_targets(parse_rules(spec), inputs, n, modulus)
+
+배선 규칙 task (src/wiring.py):
+    targets = build_fn_targets(make_wire_fn(spec, op, n, m, modulus), inputs)
 """
 
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 
-from src.rules import Step, run_rules
+from src.rules import Step, parse_rules, run_rules
+from src.wiring import make_wire_fn
 
 
 def _alternate(values: Sequence[int]) -> List[int]:
@@ -98,6 +102,8 @@ MODULUS_TASKS = frozenset({"mod", "alt_mod", "shift_mod", "shift_alt_mod", "sum_
 SHIFT_TASKS = frozenset({"shift_mod", "shift_alt_mod", "sum_shift"})
 # --rules 로 만든 규칙 조합 task 의 이름. 출력은 [0, modulus) 라 modulus <= n.
 RULES_TASK = "rules"
+# --wiring 으로 만든 배선 규칙 task 의 이름. 출력은 [0, modulus) 라 modulus <= n.
+WIRE_TASK = "wire"
 
 
 def build_rule_targets(
@@ -116,6 +122,38 @@ def build_rule_targets(
         except ValueError as e:
             raise ValueError(f"input {values}: {e}") from e
         out[i] = [y - 1 for y in ys]
+    return out
+
+
+def make_target_fn(
+    task: str,
+    n: int,
+    m: int,
+    modulus: Optional[int] = None,
+    rules: Optional[str] = None,
+    wiring: Optional[str] = None,
+    op: str = "add",
+    op_seed: int = 0,
+) -> Callable[[Sequence[int]], List[int]]:
+    """모든 task 를 token 수열 (0..n-1) -> target token 수열 함수로 통일한다 (대칭 계산용)."""
+    if task == WIRE_TASK:
+        return make_wire_fn(wiring, op, n, m, modulus, op_seed)
+    if task == RULES_TASK:
+        steps = parse_rules(rules)
+        return lambda xs: [y - 1 for y in run_rules([int(v) + 1 for v in xs], steps, n, modulus)]
+    if task not in TASK_REGISTRY:
+        raise ValueError(f"unknown task '{task}', expected one of {sorted(TASK_REGISTRY)}")
+    fn = TASK_REGISTRY[task]
+    return lambda xs: fn([int(v) for v in xs], modulus=modulus)
+
+
+def build_fn_targets(fn: Callable[[Sequence[int]], List[int]], inputs: np.ndarray) -> np.ndarray:
+    out = np.empty_like(inputs)
+    for i, row in enumerate(inputs):
+        try:
+            out[i] = fn(row.tolist())
+        except ValueError as e:
+            raise ValueError(f"input {row.tolist()}: {e}") from e
     return out
 
 
